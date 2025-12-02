@@ -50,8 +50,8 @@
 // ================= CONFIGURATION =================
 
 // Default/Fallback Credentials
-const char* WIFI_SSID = "your_wifi";
-const char* WIFI_PASS = "your_password";
+const char* WIFI_SSID_DEFAULT = "your_wifi";
+const char* WIFI_PASS_DEFAULT = "your_password";
 
 // SHARED PIN (LED + ANTENNA)
 const int PIN_TRX = 8; 
