@@ -8,7 +8,6 @@ It synchronizes via NTP (UTC+9), generates accurate JJY minute frames, aligns tr
 Can transmit when placed directly over or under the watch.
 ![Transmitter working on Casio Lineage LCW-M100TSE-1A](https://raw.githubusercontent.com/rrabargos/jjyvibetimetransmitter/main/image.jpg "Transmitter working on Casio Lineage LCW-M100TSE-1A")
 
-
 Transmitter code is based on BotanicFields' JJY transmitter code: [Generate Standard Radio Wave JJY with Ticker of M5StickC](https://www.hackster.io/botanicfields/generate-standard-radio-wave-jjy-with-ticker-of-m5stickc-0330e0)
 
 > This project is for educational and hobby RF experimentation only.  
