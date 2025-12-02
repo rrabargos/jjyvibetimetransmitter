@@ -1,4 +1,4 @@
-# ESP32-C3 JJY Vibe Time Signal Transmitter
+#ESP32-C3 JJY Vibe Time Signal Transmitter
 #Vibe coded with Gemini 3 Pro Preview
 
 A compact JJY (Japan Standard Time) 40 kHz time-signal emulator for the ESP32-C3.  
