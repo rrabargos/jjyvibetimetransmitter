@@ -2,35 +2,45 @@
  * ---------------------------------------------------------------------------
  *  ESP32-C3 JJY Vibe Time Signal Transmitter
  *  Author: Rigor Abargos
+ *
  *  Description:
  *      Generates a 40 kHz JJY-compatible time signal using PWM on an ESP32-C3.
  *      Synchronizes time via NTP (UTC+9), encodes the full JJY minute frame,
  *      and emits amplitude-modulated carrier pulses aligned to the start of
- *      each second. Includes night-schedule transmission, drift correction,
- *      and low-power idle mode.
+ *      each second. Implements drift correction and microsecond timing.
+ *
+ *      Includes power-optimized transmission modes:
+ *          - 10-minute transmission on boot
+ *          - 15-minute transmission every hour between 00:00–05:00
+ *          - Light-sleep idle behavior outside transmission windows
+ *
+ *      Provides a WiFiManager captive portal for configuration and performs
+ *      automatic Wi-Fi shutdown after synchronization.
  *
  *  Hardware:
  *      - ESP32-C3 Dev Board
- *      - PIN_TRX (default: 8) used for antenna output + status LED
+ *      - PIN_TRX (default: 8) used for antenna output and status LED
  *
  *  Main Components:
- *      - NTP sync and JST conversion
+ *      - WiFiManager captive setup
+ *      - NTP synchronization and JST conversion
  *      - Microsecond-aligned TX start
- *      - 100 ms JJY frame interrupt via Ticker
- *      - PWM carrier generation using LEDC
- *      - Automatic Wi-Fi shutdown after sync
- *      - Light-sleep idle loop outside TX schedule
+ *      - 100 ms JJY frame generation (Ticker)
+ *      - PWM carrier generation via LEDC (40 kHz AM)
+ *      - Low-power operation modes
  *
  *  Safety:
- *      For near-field, low-power laboratory use only.
- *      Unauthorized long-range transmission may be illegal.
+ *      Intended for short-range, low-power laboratory use only.
+ *      Long-range or unauthorized transmission may violate radio laws.
  *
  *  License:
  *      MIT License
  * ---------------------------------------------------------------------------
  */
 
+
 #include <WiFi.h>
+#include <WiFiManager.h> 
 #include <Ticker.h>
 #include <time.h>
 #include <sys/time.h>
@@ -38,6 +48,8 @@
 #include <esp32-hal-ledc.h> 
 
 // ================= CONFIGURATION =================
+
+// Default/Fallback Credentials
 const char* WIFI_SSID = "your_wifi";
 const char* WIFI_PASS = "your_password";
 
@@ -45,18 +57,21 @@ const char* WIFI_PASS = "your_password";
 const int PIN_TRX = 8; 
 
 // TIME CORRECTION
-// If your clock is consistently 1 second slow, change this to 1.
-// If your clock is 1 second fast, change this to -1.
 const int TIME_SHIFT_SEC = 0; 
 
 // Settings
 const int JJY_FREQ = 40000; 
 const long GMT_OFFSET_SEC = 9 * 3600; // JST (UTC+9)
-const int FORCE_TX_MINUTES = 5;       // Boot TX duration
+
+// == SCHEDULE SETTINGS ==
+const int BOOT_TX_MINUTES = 10;      // Transmit for 10 mins after power on
+const int NIGHT_TX_MINUTES = 15;     // Transmit for first 15 mins of the hour...
+const int NIGHT_START_HOUR = 0;      // ...starting at 00:00
+const int NIGHT_END_HOUR = 5;        // ...ending at 05:00
 
 // =================================================
 
-enum SystemState { STATE_BOOT, STATE_SYNCING, STATE_TRANSMITTING, STATE_LOCKED_IDLE, STATE_ERROR };
+enum SystemState { STATE_BOOT, STATE_SYNCING, STATE_TRANSMITTING, STATE_LOCKED_IDLE };
 volatile SystemState currentState = STATE_BOOT;
 
 struct tm timeinfo;
@@ -64,7 +79,6 @@ struct timeval tv_now;
 Ticker tickJjy; 
 
 unsigned long bootTime = 0;
-bool wifiOn = false;
 
 // PWM 8-bit
 const int PWM_RES = 8;
@@ -73,6 +87,7 @@ const int DUTY_OFF = 0;
 const int CODE_MARKER = 0xFF;
 
 // Prototypes
+void setupWiFi();
 void jjyHandler();
 void startTransmission();
 void stopTransmission();
@@ -88,41 +103,38 @@ void setup() {
   Serial.println("\n\n=== JJY Signal Transmitter by Rigor Abargos ===");
 
   pinMode(PIN_TRX, OUTPUT);
-  digitalWrite(PIN_TRX, HIGH); 
+  digitalWrite(PIN_TRX, HIGH); // LED ON during setup
 
   bootTime = millis();
+  
+  // Handle WiFi Connection (3 Retries -> Captive Portal)
+  setupWiFi();
+
+  // If we reach here, WiFi is connected
   currentState = STATE_SYNCING; 
 }
 
 void loop() {
   // ============================================================
-  // STATE 1: SYNCING
+  // STATE 1: SYNCING (Fetch Time)
   // ============================================================
   if (currentState == STATE_SYNCING) {
-    if (!wifiOn) {
-      Serial.print("Connecting to Wi-Fi: "); Serial.println(WIFI_SSID);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
-      wifiOn = true;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("Connected. NTP...");
-      configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org");
-      
-      if (getLocalTime(&timeinfo)) {
-        Serial.println(" Locked!");
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        wifiOn = false;
-        startTransmission(); // Start aligned TX
-      }
-    }
+    Serial.print("Connected. Fetching NTP...");
+    configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org");
     
-    if (millis() - bootTime > 20000 && !wifiOn) {
-      Serial.println("Sync Failed. Rebooting.");
-      ESP.restart();
+    // Wait for time to set
+    if (getLocalTime(&timeinfo)) {
+      Serial.println(" Locked!");
+      
+      // DISCONNECT WIFI TO REDUCE NOISE
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      
+      startTransmission(); // Start aligned TX
+    } else {
+      Serial.println("NTP Failed. Retrying...");
+      delay(1000);
     }
-    delay(100); 
     return;
   }
 
@@ -132,14 +144,21 @@ void loop() {
   if (currentState == STATE_TRANSMITTING) {
     getLocalTime(&timeinfo);
 
-    bool bootRule  = (millis() - bootTime < (FORCE_TX_MINUTES * 60 * 1000UL));
-    bool nightRule = (timeinfo.tm_hour >= 0 && timeinfo.tm_hour < 5);
+    // Rule 1: Boot Period (First 10 mins)
+    bool isBootPeriod = (millis() - bootTime < (BOOT_TX_MINUTES * 60 * 1000UL));
 
-    if (!bootRule && !nightRule) {
-      Serial.println("Schedule Ended. Sleep Mode.");
+    // Rule 2: Night Schedule (00:00-05:00, first 15 mins of hour)
+    bool isNightWindow = (timeinfo.tm_hour >= NIGHT_START_HOUR && timeinfo.tm_hour < NIGHT_END_HOUR);
+    bool isNightTxTime = isNightWindow && (timeinfo.tm_min < NIGHT_TX_MINUTES);
+
+    // If neither rule is active, stop transmitting
+    if (!isBootPeriod && !isNightTxTime) {
+      Serial.println("Transmission Window Closed. Entering Sleep.");
       stopTransmission(); 
     }
-    delay(100); 
+    
+    // Check every 1s so we don't block the Ticker
+    delay(1000); 
     return;
   }
 
@@ -147,54 +166,97 @@ void loop() {
   // STATE 3: IDLE (Light Sleep)
   // ============================================================
   if (currentState == STATE_LOCKED_IDLE) {
-    // Heartbeat
+    // Heartbeat (Short blink every wake cycle to show it's alive)
     digitalWrite(PIN_TRX, LOW);  
-    delay(50); 
+    delay(20); 
     digitalWrite(PIN_TRX, HIGH); 
 
     // Check Schedule
     getLocalTime(&timeinfo);
-    if (timeinfo.tm_hour >= 0 && timeinfo.tm_hour < 5) {
+    
+    bool isNightWindow = (timeinfo.tm_hour >= NIGHT_START_HOUR && timeinfo.tm_hour < NIGHT_END_HOUR);
+    bool isNightTxTime = isNightWindow && (timeinfo.tm_min < NIGHT_TX_MINUTES);
+
+    if (isNightTxTime) {
+       Serial.println("Night Schedule Active. Waking up...");
        startTransmission();
        return; 
     }
 
-    // Sleep 15s
+    // Light Sleep for 15 seconds to save power while maintaining time
+    // We wake up periodically to check if the new hour has started
     esp_sleep_enable_timer_wakeup(15 * 1000000ULL); 
     esp_light_sleep_start();
   }
 }
 
 // ============================================================
-// HARDWARE CONTROL (With Alignment Fix)
+// WIFI LOGIC (RETRIES + CAPTIVE PORTAL)
+// ============================================================
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  
+  // 1. Try to connect using hardcoded defaults or saved creds
+  Serial.print("Connecting to Wi-Fi...");
+  WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 3) {
+    delay(2000);
+    Serial.print(".");
+    retries++;
+  }
+
+  // 2. If connected, return
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi Connected!");
+    return;
+  }
+
+  // 3. If failed 3 times, start Captive Portal
+  Serial.println("\nConnection failed (3 retries). Starting Captive Portal.");
+  Serial.println("Connect to Wi-Fi: 'JJY-SETUP' to configure.");
+  
+  // Blink LED fast to indicate Portal Mode
+  for(int i=0; i<5; i++) { digitalWrite(PIN_TRX, !digitalRead(PIN_TRX)); delay(100); }
+
+  WiFiManager wm;
+  
+  // Timeout 3 mins
+  wm.setConfigPortalTimeout(180); 
+
+  // Starts AP "JJY-SETUP" (No password)
+  if (!wm.startConfigPortal("JJY-SETUP")) {
+    Serial.println("Failed to connect and hit timeout. Rebooting...");
+    ESP.restart();
+  }
+
+  Serial.println("\nWi-Fi Connected via Portal!");
+}
+
+// ============================================================
+// HARDWARE CONTROL (Aligned)
 // ============================================================
 
 void startTransmission() {
   Serial.print("Aligning signal to next second...");
   
-  // 1. PHASE ALIGNMENT
-  // We wait until the microseconds roll over to 0 (Start of next second)
-  // This ensures our 100ms interrupts hit exactly at .000, .100, .200...
-  // preventing "jitter" which confuses clocks.
   struct timeval tv;
   gettimeofday(&tv, NULL);
   
-  // Calculate how many ms to wait until the next full second
+  // Wait until microseconds roll over to 0 for precision
   unsigned long waitMs = 1000 - (tv.tv_usec / 1000);
-  
-  // Wait (blocking is fine here, we are just starting)
   if (waitMs > 0 && waitMs < 1000) delay(waitMs);
   
   Serial.println(" NOW!");
   currentState = STATE_TRANSMITTING;
   
-  // 2. Start Hardware
   if (!ledcAttach(PIN_TRX, JJY_FREQ, PWM_RES)) {
     Serial.println("PWM Fail! Rebooting.");
     ESP.restart();
   }
   
-  // 3. Start Ticker immediately (now aligned to ~0ms)
   tickJjy.attach_ms(100, jjyHandler);
 }
 
@@ -213,7 +275,6 @@ void stopTransmission() {
 
 void jjyHandler() {
   gettimeofday(&tv_now, NULL);
-  // Slot 0-9 (representing 0ms to 900ms)
   long slot = tv_now.tv_usec / 100000L;
 
   switch(slot) {
@@ -238,14 +299,10 @@ int int3bcd(int a) { return (a % 10) + (a / 10 % 10 * 16) + (a / 100 % 10 * 256)
 int parity8(int a) { int pa = a; for(int i = 1; i < 8; i++) pa += a >> i; return pa % 2; }
 
 int getJJYCode() {
-  // 1. Get Current Time
   time_t now;
   time(&now);
-  
-  // 2. APPLY USER OFFSET
   now += TIME_SHIFT_SEC;
 
-  // 3. Convert back to struct tm
   struct tm t_enc;
   localtime_r(&now, &t_enc);
 
