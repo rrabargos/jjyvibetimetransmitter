@@ -46,6 +46,7 @@
 #include <sys/time.h>
 #include <esp_sleep.h>      
 #include <esp32-hal-ledc.h> 
+#include <Preferences.h>
 
 // ================= CONFIGURATION =================
 
@@ -77,6 +78,7 @@ volatile SystemState currentState = STATE_BOOT;
 struct tm timeinfo;
 struct timeval tv_now;
 Ticker tickJjy; 
+Preferences preferences;
 
 unsigned long bootTime = 0;
 
@@ -127,7 +129,6 @@ void loop() {
       Serial.println(" Locked!");
       
       // DISCONNECT WIFI TO REDUCE NOISE
-      WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       
       startTransmission(); // Start aligned TX
@@ -197,43 +198,78 @@ void loop() {
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   
-  // 1. Try to connect using hardcoded defaults or saved creds
-  Serial.print("Connecting to Wi-Fi...");
-  WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+  // 1. Open Preferences with namespace "jjy-config"
+  // false = read/write mode
+  preferences.begin("jjy-config", false);
 
+  // 2. Read manually saved credentials
+  String prefSSID = preferences.getString("ssid", ""); 
+  String prefPass = preferences.getString("pass", "");
+
+  // 3. Decide which credentials to use
+  if (prefSSID.length() > 0) {
+    Serial.print("Reading from Preferences: ");
+    Serial.println(prefSSID);
+    WiFi.begin(prefSSID.c_str(), prefPass.c_str());
+  } else {
+    Serial.print("Preferences empty. Using Hardcoded Default: ");
+    Serial.println(WIFI_SSID_DEFAULT);
+    WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+  }
+
+  // 4. Retry Loop (3 Attempts)
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 3) {
-    delay(2000);
-    Serial.print(".");
+    Serial.print("Connecting... Attempt ");
+    Serial.println(retries + 1);
+    
+    // Wait 5 seconds per attempt
+    for(int i=0; i<50; i++) {
+      if(WiFi.status() == WL_CONNECTED) break;
+      delay(100);
+    }
     retries++;
   }
 
-  // 2. If connected, return
+  // 5. Success Check
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWi-Fi Connected!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    preferences.end(); // Close preferences
     return;
   }
 
-  // 3. If failed 3 times, start Captive Portal
-  Serial.println("\nConnection failed (3 retries). Starting Captive Portal.");
-  Serial.println("Connect to Wi-Fi: 'JJY-SETUP' to configure.");
+  // 6. Failure -> Captive Portal
+  Serial.println("\nConnection Failed. Launching 'JJY-SETUP' Portal.");
   
-  // Blink LED fast to indicate Portal Mode
-  for(int i=0; i<5; i++) { digitalWrite(PIN_TRX, !digitalRead(PIN_TRX)); delay(100); }
+  // Fast Blink
+  for(int i=0; i<10; i++) { digitalWrite(PIN_TRX, !digitalRead(PIN_TRX)); delay(50); }
 
   WiFiManager wm;
-  
-  // Timeout 3 mins
-  wm.setConfigPortalTimeout(180); 
+  wm.setConfigPortalTimeout(180); // 3 minutes
 
-  // Starts AP "JJY-SETUP" (No password)
+  // If this returns true, the user connected and the ESP is now connected to WiFi
   if (!wm.startConfigPortal("JJY-SETUP")) {
-    Serial.println("Failed to connect and hit timeout. Rebooting...");
+    Serial.println("Portal Timeout. Rebooting...");
     ESP.restart();
   }
 
-  Serial.println("\nWi-Fi Connected via Portal!");
+  // 7. CAPTURE AND SAVE NEW CREDENTIALS
+  Serial.println("\nConnected via Portal! Saving to Preferences...");
+  
+  String newSSID = WiFi.SSID();
+  String newPass = WiFi.psk();
+
+  // Save to manual storage
+  preferences.putString("ssid", newSSID);
+  preferences.putString("pass", newPass);
+  preferences.end();
+
+  Serial.println("Saved! Rebooting to apply clean state...");
+  delay(1000);
+  ESP.restart();
 }
+
 
 // ============================================================
 // HARDWARE CONTROL (Aligned)
