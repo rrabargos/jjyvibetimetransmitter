@@ -149,15 +149,22 @@ void loop() {
   if (currentState == STATE_TRANSMITTING) {
     getLocalTime(&timeinfo);
 
-    // Rule 1: Boot Period (First 10 mins)
-    bool isBootPeriod = (millis() - bootTime < (BOOT_TX_MINUTES * 60 * 1000UL));
+    // --- PRIORITY 1: BOOT/MANUAL SYNC PERIOD ---
+    // If the device was just reset (manual sync), we transmit for BOOT_TX_MINUTES
+    // regardless of what the clock says (Midnight rules are ignored here).
+    if (millis() - bootTime < (BOOT_TX_MINUTES * 60 * 1000UL)) {
+        // Keep transmitting, don't check schedule yet.
+        delay(1000);
+        return;
+    }
 
-    // Rule 2: Night Schedule (00:00-05:00, first 15 mins of hour)
+    // --- PRIORITY 2: SCHEDULED NIGHT TRANSMISSION ---
+    // Only reachable if Boot Period has expired.
     bool isNightWindow = (timeinfo.tm_hour >= NIGHT_START_HOUR && timeinfo.tm_hour < NIGHT_END_HOUR);
     bool isNightTxTime = isNightWindow && (timeinfo.tm_min < NIGHT_TX_MINUTES);
 
-    // If neither rule is active, stop transmitting
-    if (!isBootPeriod && !isNightTxTime) {
+    if (!isNightTxTime) {
+      // If we are not in boot period AND not in night schedule, stop.
       Serial.println("Transmission Window Closed. Entering Sleep.");
       stopTransmission(); 
     }
