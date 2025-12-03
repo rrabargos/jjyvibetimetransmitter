@@ -9,17 +9,17 @@
  *      and emits amplitude-modulated carrier pulses aligned to the start of
  *      each second. Implements drift correction and microsecond timing.
  *
- *      Includes power-optimized transmission modes:
+ *      Power-optimized transmission modes:
  *          - 10-minute transmission on boot
  *          - 15-minute transmission every hour between 00:00–05:00
  *          - Light-sleep idle behavior outside transmission windows
  *
- *      Provides a WiFiManager captive portal for configuration and performs
- *      automatic Wi-Fi shutdown after synchronization.
+ *      Configuration via WiFiManager captive portal with automatic Wi-Fi shutdown
+ *      after synchronization.
  *
  *  Hardware:
  *      - ESP32-C3 Dev Board
- *      - PIN_TRX (default: 8) used for antenna output and status LED
+ *      - Separate pins for antenna output and status LED
  *
  *  Main Components:
  *      - WiFiManager captive setup
@@ -38,7 +38,6 @@
  * ---------------------------------------------------------------------------
  */
 
-
 #include <WiFi.h>
 #include <WiFiManager.h> 
 #include <Ticker.h>
@@ -54,8 +53,9 @@
 const char* WIFI_SSID_DEFAULT = "your_wifi";
 const char* WIFI_PASS_DEFAULT = "your_password";
 
-// SHARED PIN (LED + ANTENNA)
-const int PIN_TRX = 8; 
+// === HARDWARE PINS ===
+const int PIN_LED = 8;    // Onboard LED (Status Indicator)
+const int PIN_ANT = 1;    // [CHANGE THIS] New Antenna Output Pin
 
 // TIME CORRECTION
 const int TIME_SHIFT_SEC = 0; 
@@ -104,8 +104,12 @@ void setup() {
   delay(2000); 
   Serial.println("\n\n=== JJY Signal Transmitter by Rigor Abargos ===");
 
-  pinMode(PIN_TRX, OUTPUT);
-  digitalWrite(PIN_TRX, HIGH); // LED ON during setup
+  // Initialize Split Pins
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_ANT, OUTPUT);
+  
+  digitalWrite(PIN_LED, HIGH); // LED ON during setup
+  digitalWrite(PIN_ANT, LOW);  // ANT OFF during setup
 
   bootTime = millis();
   
@@ -168,9 +172,9 @@ void loop() {
   // ============================================================
   if (currentState == STATE_LOCKED_IDLE) {
     // Heartbeat (Short blink every wake cycle to show it's alive)
-    digitalWrite(PIN_TRX, LOW);  
+    digitalWrite(PIN_LED, LOW);  
     delay(20); 
-    digitalWrite(PIN_TRX, HIGH); 
+    digitalWrite(PIN_LED, HIGH); 
 
     // Check Schedule
     getLocalTime(&timeinfo);
@@ -196,7 +200,7 @@ void loop() {
 // ============================================================
 
 void setupWiFi() {
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_STA);WiFi.setTxPower(WIFI_POWER_8_5dBm); 
   
   // 1. Open Preferences with namespace "jjy-config"
   // false = read/write mode
@@ -242,8 +246,8 @@ void setupWiFi() {
   // 6. Failure -> Captive Portal
   Serial.println("\nConnection Failed. Launching 'JJY-SETUP' Portal.");
   
-  // Fast Blink
-  for(int i=0; i<10; i++) { digitalWrite(PIN_TRX, !digitalRead(PIN_TRX)); delay(50); }
+  // Fast Blink on LED only
+  for(int i=0; i<10; i++) { digitalWrite(PIN_LED, !digitalRead(PIN_LED)); delay(50); }
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(180); // 3 minutes
@@ -288,7 +292,8 @@ void startTransmission() {
   Serial.println(" NOW!");
   currentState = STATE_TRANSMITTING;
   
-  if (!ledcAttach(PIN_TRX, JJY_FREQ, PWM_RES)) {
+  // Attach PWM specifically to PIN_ANT
+  if (!ledcAttach(PIN_ANT, JJY_FREQ, PWM_RES)) {
     Serial.println("PWM Fail! Rebooting.");
     ESP.restart();
   }
@@ -299,9 +304,15 @@ void startTransmission() {
 void stopTransmission() {
   Serial.println("STOPPING SIGNAL.");
   tickJjy.detach();
-  ledcDetach(PIN_TRX);
-  pinMode(PIN_TRX, OUTPUT);
-  digitalWrite(PIN_TRX, HIGH); 
+  
+  // Detach PWM from Antenna
+  ledcDetach(PIN_ANT);
+  pinMode(PIN_ANT, OUTPUT);
+  digitalWrite(PIN_ANT, LOW); // Ensure Antenna is OFF
+
+  // Return LED to idle state
+  digitalWrite(PIN_LED, HIGH); 
+  
   currentState = STATE_LOCKED_IDLE;
 }
 
@@ -324,8 +335,18 @@ void jjyHandler() {
   }
 }
 
-void carrierOn() { ledcWrite(PIN_TRX, DUTY_50); }
-void carrierOff() { ledcWrite(PIN_TRX, DUTY_OFF); }
+// Updated to control both pins:
+// ANT = 40kHz PWM
+// LED = Digital Visual Sync
+void carrierOn() { 
+  ledcWrite(PIN_ANT, DUTY_50); 
+  digitalWrite(PIN_LED, HIGH); // Visual indicator ON
+}
+
+void carrierOff() { 
+  ledcWrite(PIN_ANT, DUTY_OFF); 
+  digitalWrite(PIN_LED, LOW);  // Visual indicator OFF
+}
 
 // ============================================================
 // JJY ENCODING 
