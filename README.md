@@ -40,7 +40,7 @@ Transmitter code is based on BotanicFields' JJY transmitter code: [Generate Stan
 ## Wiring
 
 ```
-ESP32-C3 Pin 8  →  Antenna (short wire)
+ESP32-C3 Pin 1  →  Antenna (short wire)
 ESP32-C3 GND    →  Ground
 ```
 
