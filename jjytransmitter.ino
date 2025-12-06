@@ -1,22 +1,31 @@
 /*
  * ---------------------------------------------------------------------------
- *  ESP32-C3 JJY Time Signal Transmitter (Production)
+ *  ESP32-C3 JJY Time Signal Transmitter by Rigor Abargos
  *  
  *  Description:
- *      Generates a 40kHz JJY-compatible time signal to synchronize radio 
- *      clocks. Optimized for long battery life and unreliable internet.
- *  
- *  Key Features:
- *      1. Precision Timing: Uses High-Res Hardware Timer (esp_timer) in IRAM 
- *         and forced XTAL during sleep to eliminate drift.
- *      2. Robust NTP: Prioritizes low-latency Google servers (Asia). Falls 
- *         back to hardcoded IPs if DNS fails.
- *      3. Drift Fix: Detects wake source (Deep Sleep vs Reset) to prevent 
- *         test signals from corrupting midnight alignment.
- *      4. Smart Power: Deep Sleep during day (5uA). Light Sleep at night 
- *         to maintain clock precision.
- *      5. Remote Logging: Batches system logs and uploads to Google Sheets 
- *         upon boot and before deep sleep.
+ *      Emulates the Japanese JJY (40kHz) radio time signal to synchronize 
+ *      radio-controlled clocks. Designed for unstable network environments 
+ *      and long battery life.
+ *
+ *  Core Strategies:
+ *  1. STRICT PRECISION:
+ *     - Connects and Syncs NTP before *every* hourly broadcast.
+ *     - If NTP Sync fails, the device goes to Sleep (No broadcast of wrong time).
+ *     - Uses "Active Wait" (CPU Spin) for the last few minutes before the hour
+ *       to guarantee the broadcast starts exactly at 00:00:00.00.
+ *
+ *  2. DEEP SLEEP / BATTERY SAVING:
+ *     - Daytime (06:00 - 23:55): Deep Sleep (~5µA).
+ *     - Night Idle (Min 15 - 55): Deep Sleep between hourly broadcasts.
+ *     - WiFi is only active for ~60 seconds per hour.
+ *
+ *  3. BOOT TEST MODE:
+ *     - On power-up/reset, transmits immediately for 10 minutes (if NTP syncs)
+ *       to allow instant testing without waiting for midnight.
+ *
+ *  Schedule (JST):
+ *      - 23:55 : Wake Up, Sync, Prep for Midnight.
+ *      - 00:00 - 06:00 : Hourly Broadcasts (Minutes 00-15).
  * ---------------------------------------------------------------------------
  */
 
@@ -25,51 +34,44 @@
 #include <time.h>
 #include <sys/time.h>
 #include <esp_sleep.h>      
+#include <esp32-hal-ledc.h> 
 #include <Preferences.h>
 #include <esp_sntp.h>
 #include <esp_netif_sntp.h> 
 #include <esp_timer.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 
 // ================= CONFIGURATION =================
-
-const char* G_SCRIPT_URL = "https://script.google.com/macros/s/YOUR_LONG_DEPLOYMENT_ID_HERE/exec";
-const char* DEVICE_NAME  = "ESP32-JJY-01";
 
 const char* WIFI_SSID_DEFAULT = "your_wifi";
 const char* WIFI_PASS_DEFAULT = "your_password";
 
+// Hardware Pins
 const int PIN_LED = 8;    
 const int PIN_ANT = 1;    
 
+// Signal Settings
 const long GMT_OFFSET_SEC = 9 * 3600; // JST (UTC+9)
 const int JJY_FREQ = 40000; 
 const int TIME_SHIFT_SEC = 0; 
 
-// Schedule (Hours in 24h format)
-const int BOOT_TX_MINUTES = 10;      
-const int NIGHT_TX_MINUTES = 15;     
+// Schedule Settings
+const int BOOT_TX_MINUTES = 10;      // Initial test duration
+const int NIGHT_TX_MINUTES = 15;     // Duration of hourly broadcast
 const int NIGHT_START_HOUR = 0;      
-const int NIGHT_END_HOUR = 5;        
+const int NIGHT_END_HOUR = 6;        // Ends at 06:00
 const int WAKEUP_HOUR = 23;          
-const int WAKEUP_MIN = 50;
+const int WAKEUP_MIN = 55;           // Prep time before midnight
 
-// ================= GLOBALS =================
-
-enum SystemState { STATE_BOOT_SYNC, STATE_RUNNING };
-SystemState currentState = STATE_BOOT_SYNC;
+// =================================================
 
 struct tm timeinfo;
 Preferences preferences;
 
-unsigned long bootTime = 0;
 esp_timer_handle_t jjyTimerHandle = nullptr;
-bool isScheduledWake = false; 
-String logBuffer = ""; 
 
 const int PWM_RES = 8;
 const int DUTY_50 = 127;
+
 const int CODE_MARKER = 2; 
 const int CODE_LOW = 0;
 const int CODE_HIGH = 1;
@@ -77,65 +79,93 @@ const int CODE_HIGH = 1;
 volatile int currentSecondCode = -1; 
 volatile int currentSlot100ms = 0;
 
-// ================= PROTOTYPES =================
+// Prototypes
 void setupWiFi();
-void ensureNTPSyncOrReboot();
+bool robustNTPSync(); 
 void startTransmission();
 void stopTransmission();
-void enterDaytimeDeepSleep();
-void enterLightSleep(uint64_t seconds);
+void enterDeepSleepUntil(int targetHour, int targetMin);
+void waitForTopOfHour();
 void IRAM_ATTR onTimer(void* arg); 
 int calculateJJYCodeForTime(time_t t);
 int int3bcd(int a);
 int parity8(int a);
 void time_sync_notification_cb(struct timeval *tv);
-void sysLog(String msg);
-void uploadLogs();
 
 // ============================================================
-// MAIN SETUP
+// SETUP (Runs on every Wake/Boot)
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000); 
-  sysLog("=== Boot Sequence Started ===");
+  delay(500); 
+  Serial.println("\n\n=== JJY Transmitter Started ===");
 
-  // Determine if this is a scheduled wake (23:50) or a manual reset
-  if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
-      sysLog("Wake Source: Scheduled Deep Sleep. Skipping Boot Test.");
-      isScheduledWake = true;
-  } else {
-      sysLog("Wake Source: Manual Reset. Boot Test Enabled.");
-      isScheduledWake = false;
-  }
-
-  // Force 40MHz Crystal ON during Light Sleep to prevent time drift
-  esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_ON);
-  
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_ANT, OUTPUT);
   digitalWrite(PIN_LED, HIGH);
   digitalWrite(PIN_ANT, LOW);
 
-  bootTime = millis();
-  
+  // 1. GATEKEEPER: Sync Time
   setupWiFi();
-
-  currentState = STATE_BOOT_SYNC;
-  ensureNTPSyncOrReboot(); 
-
-  // Upload initial boot logs before cutting WiFi
-  sysLog("Setup complete. Disconnecting WiFi.");
-  uploadLogs();
-
+  bool timeLocked = robustNTPSync();
+  
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   
-  currentState = STATE_RUNNING;
+  // Strict Rule: No Sync = No Transmission
+  if (!timeLocked) {
+      Serial.println("CRITICAL: NTP Failed. Aborting to prevent wrong time.");
+      Serial.println("Retrying in 1 hour...");
+      esp_sleep_enable_timer_wakeup(3600 * 1000000ULL);
+      esp_deep_sleep_start();
+      return; 
+  }
+
+  // 2. Get Accurate Time
+  time_t now;
+  time(&now);
+  time_t jst_now = now + GMT_OFFSET_SEC;
+  localtime_r(&jst_now, &timeinfo);
   
-  // Only start immediate transmission if it's a manual reset (test mode)
-  if (!isScheduledWake && (millis() - bootTime < (BOOT_TX_MINUTES * 60 * 1000UL))) {
+  int h = timeinfo.tm_hour;
+  int m = timeinfo.tm_min;
+
+  Serial.printf("Time Locked (JST): %02d:%02d:%02d\n", h, m, timeinfo.tm_sec);
+
+  // 3. CHECK: Boot Test Mode (First 10 mins of uptime)
+  if (millis() < (BOOT_TX_MINUTES * 60 * 1000UL)) {
+      Serial.println("Mode: Boot Test (Immediate TX)");
       startTransmission();
+      return; 
+  }
+
+  // 4. CHECK: Daytime Schedule (06:00 - 23:54)
+  if (h >= NIGHT_END_HOUR && !(h == 23 && m >= 55)) {
+      Serial.println("Mode: Daytime. Sleeping until 23:55.");
+      enterDeepSleepUntil(WAKEUP_HOUR, WAKEUP_MIN);
+      return;
+  }
+
+  // 5. CHECK: Pre-Hour Sync/Wait (Minute 55-59)
+  if (m >= 55) {
+      Serial.println("Mode: Pre-Hour. Active Wait for 00:00:00...");
+      waitForTopOfHour();
+      // Proceed to Loop for transmission
+  }
+  
+  // 6. CHECK: Broadcast Window (Minute 00-15)
+  if (m < NIGHT_TX_MINUTES) {
+      Serial.println("Mode: Broadcast Window. Transmitting...");
+      startTransmission();
+      return; 
+  }
+  
+  // 7. CHECK: Night Idle (Minute 15-54)
+  if (m >= NIGHT_TX_MINUTES && m < 55) {
+      Serial.println("Mode: Night Idle. Sleeping until Minute 59.");
+      // Wake at 59 to allow 1 min for Sync
+      enterDeepSleepUntil(h, 59);
+      return;
   }
 }
 
@@ -148,256 +178,164 @@ void loop() {
   time_t jst_now = now + GMT_OFFSET_SEC;
   localtime_r(&jst_now, &timeinfo);
 
-  // Pre-calculate JJY code for the ISR
+  // 1. Update Signal Code for ISR
   static time_t lastSec = 0;
   if (now != lastSec) {
     lastSec = now;
     currentSecondCode = calculateJJYCodeForTime(jst_now + TIME_SHIFT_SEC);
   }
 
-  // 1. Boot Test Mode (Manual Reset Only)
-  if (!isScheduledWake && (millis() - bootTime < (BOOT_TX_MINUTES * 60 * 1000UL))) {
-      if (!jjyTimerHandle) startTransmission();
-      delay(100); 
-      return;
-  }
+  bool isBootTest = (millis() < (BOOT_TX_MINUTES * 60 * 1000UL));
 
-  int h = timeinfo.tm_hour;
-  int m = timeinfo.tm_min;
-
-  // 2. Pre-Midnight Buffer (23:50 -> 00:00)
-  // Stops TX and holds precise time until midnight alignment
-  if (h == 23 && m >= WAKEUP_MIN) {
-     if (jjyTimerHandle) stopTransmission(); 
-     int secRemaining = (59 - m) * 60 + (60 - timeinfo.tm_sec);
-     
-     sysLog("Pre-Midnight. Holding XTAL (" + String(secRemaining) + "s)");
-     enterLightSleep(secRemaining);
-     return;
-  }
-
-  // 3. Night Schedule (00:00 -> 05:00)
-  if (h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR) {
-    // Transmit Window
-    if (m < NIGHT_TX_MINUTES) {
-      if (!jjyTimerHandle) startTransmission();
-      delay(100);
-      return; 
-    } 
-    // Idle Window (Power Saving)
-    else {
-      if (jjyTimerHandle) stopTransmission();
-      int secRemaining = (59 - m) * 60 + (60 - timeinfo.tm_sec);
+  if (!isBootTest) {
+      // End of Broadcast Window (Minute 15)
+      if (timeinfo.tm_min >= NIGHT_TX_MINUTES) {
+          Serial.println("Broadcast Finished. Sleeping.");
+          stopTransmission();
+          enterDeepSleepUntil(timeinfo.tm_hour, 59);
+      }
       
-      sysLog("Night Idle (" + String(h) + ":15). Sleep " + String(secRemaining) + "s");
-      enterLightSleep(secRemaining);
-      return;
-    }
-  }
-
-  // 4. Daytime Deep Sleep
-  if (jjyTimerHandle) stopTransmission();
-  
-  sysLog("Morning reached. Uploading Night Logs & Sleeping.");
-  uploadLogs(); 
-  
-  enterDaytimeDeepSleep();
-}
-
-// ============================================================
-// LOGGING & UPLOAD
-// ============================================================
-
-void sysLog(String msg) {
-  Serial.println(msg); 
-  logBuffer += msg + " | "; 
-}
-
-void uploadLogs() {
-  if (logBuffer == "") return; 
-
-  Serial.println(">> Uploading logs...");
-
-  bool localWiFiConnect = false;
-  
-  // Reconnect if needed
-  if (WiFi.status() != WL_CONNECTED) {
-      localWiFiConnect = true;
-      WiFi.mode(WIFI_STA);
-      WiFi.setTxPower(WIFI_POWER_8_5dBm); // Low power mode
-
-      preferences.begin("jjy-config", true);
-      String ssid = preferences.getString("ssid", WIFI_SSID_DEFAULT);
-      String pass = preferences.getString("pass", WIFI_PASS_DEFAULT);
-      preferences.end();
-      
-      if(ssid == "your_wifi") { ssid = WIFI_SSID_DEFAULT; pass = WIFI_PASS_DEFAULT; }
-      
-      WiFi.begin(ssid.c_str(), pass.c_str());
-      int retries = 0;
-      while(WiFi.status() != WL_CONNECTED && retries < 20) {
-          delay(500); retries++;
+      // End of Night Schedule (Hour 06)
+      if (timeinfo.tm_hour >= NIGHT_END_HOUR) {
+          Serial.println("Night Schedule End. Sleeping until 23:55.");
+          stopTransmission();
+          enterDeepSleepUntil(WAKEUP_HOUR, WAKEUP_MIN);
       }
   }
+}
 
-  if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      WiFiClientSecure client;
-      client.setInsecure(); // Skip cert validation for speed/memory
-      
-      http.begin(client, G_SCRIPT_URL);
-      http.addHeader("Content-Type", "application/json");
-      
-      String json = "{\"deviceId\":\"" + String(DEVICE_NAME) + "\", \"log\":\"" + logBuffer + "\"}";
-      int httpResponseCode = http.POST(json);
-      
-      if (httpResponseCode > 0) {
-          Serial.printf(">> Upload Success: %d\n", httpResponseCode);
-          logBuffer = ""; 
-      } else {
-          Serial.printf(">> Upload Failed: %s\n", http.errorToString(httpResponseCode).c_str());
-      }
-      http.end();
-  }
+// ============================================================
+// ACTIVE WAIT (Precision Logic)
+// ============================================================
+void waitForTopOfHour() {
+  // spin-wait to catch the exact second rollover
+  while(true) {
+    time_t now;
+    time(&now);
+    time_t jst_now = now + GMT_OFFSET_SEC;
+    struct tm t;
+    localtime_r(&jst_now, &t);
 
-  if (localWiFiConnect) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
+    if (t.tm_min == 0 && t.tm_sec == 0) return; // Exact Match
+    if (t.tm_min == 0 && t.tm_sec > 0) return;  // Late Entry Catch
+    if (t.tm_min > 0 && t.tm_min < 10) return;  // Overflow Catch
+
+    // Heartbeat
+    if (t.tm_sec % 5 == 0) digitalWrite(PIN_LED, !digitalRead(PIN_LED)); 
+    delay(20); 
   }
 }
 
 // ============================================================
-// ROBUST NTP
+// SLEEP LOGIC
 // ============================================================
-
-void time_sync_notification_cb(struct timeval *tv) {
-    sysLog("NTP Callback: Sync OK");
-}
-
-void ensureNTPSyncOrReboot() {
-  sysLog("Initializing SNTP...");
-  esp_netif_sntp_deinit();
-
-  // Primary: Google Hostname
-  esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
-  config.sync_cb = time_sync_notification_cb;
-  esp_netif_sntp_init(&config);
-  
-  // Backups
-  esp_sntp_setservername(1, "time.nist.gov");
-  esp_sntp_setservername(2, "pool.ntp.org");
-
-  Serial.print("Waiting for time");
-  esp_err_t err = esp_netif_sntp_sync_wait(30000 / portTICK_PERIOD_MS);
-
-  if (err == ESP_OK) {
-    sysLog("Hostname Sync OK");
-  } 
-  else {
-    sysLog("Hostname Fail. Trying IP Fallback...");
-    esp_netif_sntp_deinit();
-    
-    // Fallback: Google IP (Bypasses DNS)
-    esp_sntp_config_t config_ip = ESP_NETIF_SNTP_DEFAULT_CONFIG("216.239.35.0"); 
-    config_ip.sync_cb = time_sync_notification_cb;
-    esp_netif_sntp_init(&config_ip);
-    
-    err = esp_netif_sntp_sync_wait(20000 / portTICK_PERIOD_MS);
-    
-    if (err != ESP_OK) {
-        sysLog("CRITICAL: NTP Fail. Sleeping 1h.");
-        uploadLogs(); 
-        esp_sleep_enable_timer_wakeup(60 * 60 * 1000000ULL);
-        esp_deep_sleep_start();
-    }
-  }
-}
-
-// ============================================================
-// WIFI & UTILS
-// ============================================================
-
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  
-  preferences.begin("jjy-config", false);
-  String ssid = preferences.getString("ssid", WIFI_SSID_DEFAULT);
-  String pass = preferences.getString("pass", WIFI_PASS_DEFAULT);
-  
-  if(ssid == "your_wifi") { ssid = WIFI_SSID_DEFAULT; pass = WIFI_PASS_DEFAULT; }
-
-  bool connected = false;
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    Serial.printf("WiFi Attempt %d/3... ", attempt);
-    WiFi.disconnect(); delay(100); 
-    WiFi.begin(ssid.c_str(), pass.c_str());
-
-    for(int w=0; w<20; w++) { 
-      if(WiFi.status() == WL_CONNECTED) { connected = true; break; }
-      delay(500);
-    }
-    if(connected) break;
-    Serial.println("Failed.");
-  }
-
-  if (!connected) {
-    Serial.println("\nLaunching Captive Portal...");
-    WiFiManager wm;
-    wm.setConfigPortalTimeout(180);
-    if (!wm.startConfigPortal("JJY-SETUP")) {
-      sysLog("Portal Timeout. Reboot.");
-      uploadLogs();
-      ESP.restart();
-    }
-    preferences.putString("ssid", WiFi.SSID());
-    preferences.putString("pass", WiFi.psk());
-  }
-  preferences.end();
-  sysLog("WiFi Connected: " + WiFi.localIP().toString());
-}
-
-void enterLightSleep(uint64_t seconds) {
-  if (seconds < 1) return;
-  digitalWrite(PIN_LED, LOW); delay(50); digitalWrite(PIN_LED, HIGH);
-  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
-  esp_light_sleep_start();
-}
-
-void enterDaytimeDeepSleep() {
-  struct tm target_tm = timeinfo;
-  target_tm.tm_hour = WAKEUP_HOUR; 
-  target_tm.tm_min = WAKEUP_MIN;   
-  target_tm.tm_sec = 0;
-  
+void enterDeepSleepUntil(int targetHour, int targetMin) {
   time_t now;
   time(&now);
   time_t jst_now = now + GMT_OFFSET_SEC;
   
-  struct tm jst_tm;
-  localtime_r(&jst_now, &jst_tm);
-  jst_tm.tm_hour = WAKEUP_HOUR;
-  jst_tm.tm_min = WAKEUP_MIN;
-  jst_tm.tm_sec = 0;
+  struct tm target_tm;
+  localtime_r(&jst_now, &target_tm);
+  target_tm.tm_hour = targetHour;
+  target_tm.tm_min = targetMin;
+  target_tm.tm_sec = 0;
   
-  time_t target_jst = mktime(&jst_tm);
-  if (target_jst <= jst_now) target_jst += 24 * 3600; 
+  time_t target_time = mktime(&target_tm);
   
-  uint64_t secondsToSleep = (uint64_t)(target_jst - jst_now);
-  
-  sysLog("Deep Sleep: " + String((unsigned long)secondsToSleep) + "s");
-  uploadLogs(); 
+  // Logic to handle day/hour rollover
+  if (target_time <= jst_now) {
+      if (targetHour == WAKEUP_HOUR) {
+         target_time += 24 * 3600; // Next Day
+      } else {
+         target_time += 3600; // Next Hour
+      }
+  }
 
+  uint64_t secondsToSleep = (uint64_t)(target_time - jst_now);
+  
+  // Safety Clamps
+  if (secondsToSleep < 5) secondsToSleep = 5;
+  if (secondsToSleep > 87000) secondsToSleep = 60; 
+
+  Serial.printf("Deep Sleep: %llu seconds.\n", secondsToSleep);
+  Serial.flush();
+  
   esp_sleep_enable_timer_wakeup(secondsToSleep * 1000000ULL);
   esp_deep_sleep_start();
 }
+
+// ============================================================
+// NTP & WIFI (Robust + IP Fallback)
+// ============================================================
+
+void time_sync_notification_cb(struct timeval *tv) {}
+
+bool robustNTPSync() {
+  Serial.println("Syncing NTP (60s Max)...");
+  esp_netif_sntp_deinit();
+
+  // Phase 1: Try Hostnames (Google -> NIST -> Pool)
+  esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
+  config.sync_cb = time_sync_notification_cb;
+  esp_netif_sntp_init(&config);
+  
+  esp_sntp_setservername(1, "time.nist.gov");
+  esp_sntp_setservername(2, "pool.ntp.org");
+
+  esp_err_t err = esp_netif_sntp_sync_wait(35000 / portTICK_PERIOD_MS);
+
+  // Phase 2: Try Direct IP (DNS Bypass)
+  if (err != ESP_OK) {
+    Serial.println("Hostname Timeout. Trying Direct IP...");
+    esp_netif_sntp_deinit();
+    esp_sntp_config_t config_ip = ESP_NETIF_SNTP_DEFAULT_CONFIG("216.239.35.0");
+    esp_netif_sntp_init(&config_ip);
+    err = esp_netif_sntp_sync_wait(25000 / portTICK_PERIOD_MS);
+  }
+
+  if (err == ESP_OK) {
+    Serial.println("Time Locked.");
+    return true;
+  } 
+
+  Serial.println("NTP Failed!");
+  return false; 
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+  preferences.begin("jjy-config", false);
+  
+  String ssid = preferences.getString("ssid", WIFI_SSID_DEFAULT);
+  String pass = preferences.getString("pass", WIFI_PASS_DEFAULT);
+  if(ssid == "your_wifi") { ssid = WIFI_SSID_DEFAULT; pass = WIFI_PASS_DEFAULT; }
+
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  
+  // Connection timeout: ~15 seconds
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) { 
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+     Serial.println("WiFi Failed.");
+  }
+  preferences.end();
+}
+
+// ============================================================
+// SIGNAL GENERATION (Hardware Timer)
+// ============================================================
 
 void startTransmission() {
   if (jjyTimerHandle) return; 
   if (!ledcAttach(PIN_ANT, JJY_FREQ, PWM_RES)) { ESP.restart(); }
   ledcWrite(PIN_ANT, 0);
 
-  // Microsecond Alignment to the next second boundary
+  // Align to microsecond
   struct timeval tv;
   gettimeofday(&tv, NULL);
   unsigned long usecToWait = 1000000UL - tv.tv_usec;
@@ -407,7 +345,6 @@ void startTransmission() {
   const esp_timer_create_args_t timer_args = { .callback = &onTimer, .name = "jjy" };
   esp_timer_create(&timer_args, &jjyTimerHandle);
   esp_timer_start_periodic(jjyTimerHandle, 100000); 
-  sysLog("TX Started");
 }
 
 void stopTransmission() {
@@ -418,14 +355,14 @@ void stopTransmission() {
     ledcDetach(PIN_ANT);
     digitalWrite(PIN_ANT, LOW);
     digitalWrite(PIN_LED, HIGH); 
-    sysLog("TX Stopped");
   }
 }
 
-// ISR - Runs in IRAM (High Priority)
+// ISR - Runs in IRAM (No Flash Access)
 void IRAM_ATTR onTimer(void* arg) {
   if (currentSlot100ms >= 10) currentSlot100ms = 0;
   int duty = 0;
+  
   if (currentSecondCode == CODE_MARKER) {
      if (currentSlot100ms < 2) duty = DUTY_50;
   } else if (currentSecondCode == CODE_HIGH) {
@@ -433,12 +370,16 @@ void IRAM_ATTR onTimer(void* arg) {
   } else if (currentSecondCode == CODE_LOW) {
      if (currentSlot100ms < 8) duty = DUTY_50;
   }
+  
   ledcWrite(PIN_ANT, duty);
   digitalWrite(PIN_LED, (duty > 0)); 
   currentSlot100ms++;
 }
 
-// JJY Encoding Logic
+// ============================================================
+// JJY UTILS
+// ============================================================
+
 int int3bcd(int a) { return (a % 10) + (a / 10 % 10 * 16) + (a / 100 % 10 * 256); }
 int parity8(int a) { int pa = a; for(int i = 1; i < 8; i++) pa += a >> i; return pa % 2; }
 
